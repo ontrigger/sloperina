@@ -890,7 +890,7 @@ Entries 1 to 4 and 14 were empty; 35 and 40 had no name getter.
   that previously trapped Link, after turning through walls ON. Void-trigger
   visualization and optional levitation void immunity are still under investigation.
 
-### 9.5 Actors, their life and position (from the disassembly, v131072; checked in game 9th November 2026)
+### 9.5 Actors, their life and position (from the disassembly, v131072; checked in game)
 - **The actor manager** `mgr = *(main+0x4E90D90)` (`+0x00` a mutex: lock `main+0x3C42460`, unlock `main+0x3C42470`).
   The live actors are in an intrusive red-black tree at `[mgr+0x38]`: node N has left `+0x00`, right `+0x08`,
   parent|colour `+0x10`; each node is at `+8` in an entry E (`E = N - 8`) with the actor at `[E+0x28]` and the next
@@ -918,7 +918,7 @@ Entries 1 to 4 and 14 were empty; 35 and 40 had no name getter.
 - A dungeon keeps all its rooms' actors: Forest Temple had 32+ live enemies, so scene > enemy health keeps the 32
   nearest Link within 30 m. Its summary (`actors:` lines) goes to the log every 300 frames while it's on.
 
-### 9.6 The scene's depth (1.0.0, nxnative; checked 10th November 2026)
+### 9.6 The scene's depth (1.0.0, nxnative; checked in game)
 - **The texture:** Depth32F (NVN `0x34`) at the render resolution: 1536x864, smaller under dynamic resolution
   (1457x820 seen), at offset 0 of the game's 305 MB render-target pool (flags `0x2a1`). The texture *object* is
   new every frame or two (16+ addresses, its texture-pool ID with it): never keep it, take it from the game's
@@ -941,3 +941,43 @@ Entries 1 to 4 and 14 were empty; 35 and 40 had no name getter.
   early on (after 5.6 and 8 of the 144.5 MiB it decodes) on the decoder's 17 KB and 41 KB blocks while the game
   loaded; on the Mac, 4.6 MB for the cached pictures wasn't there while gz's style still held its 23 MB of
   panels and see-through buffers.
+
+### 9.7 Stored surface velocity: jumps keep a magic bean's speed
+- **The component:** `CharacterUpdateFollowSurfaceExtension` (vtable `main+0x4B9C008`, name string `0x3CA9A35`), one
+  of the components of Link's holder `[[[link+0x270]+0x50]+0x20]+0x10` (u32 count `+0xD8`, pointers at `[+0xE0]`;
+  slots 9 and 20 of 30). Its virtual update is vtable slot 10, `main+0x139DC0`. Behaviour-tree node
+  `OneshotCctFollowSurfaceSetLinearKeepType` (`0x295EBB0`) sets UsingVelocityType `+0x44` = 1, LinearKeepType `+0x48`
+  = 1, LinearAttnType `+0x4C` = 2, LinearAttnRatioStep `+0x60` = 0.00025 and `+0x64` = 5.0 for Link.
+- **Fields:** `+0x3C` enabled (u8), `+0x54/+0x58/+0x5C` the stored velocity (f32 x/y/z, units/s), `+0x68` set from
+  the support state each time the support path runs, `+0x6C` a hold counter, `+0x78` the support body found.
+- **The update:** the CCT state is `[[prop+0x48]+0x40 + 8*[[prop+0x48]+0x58]]+0x10` (prop = `[holder+8]`; the same
+  three-slot buffer `cct_on_ground` reads): 0 ground, 1 air, 2 grab/climb.
+  - In the air (state 1, LinearKeepType 1) it fades the vector (AttnType 2: lerp to 0 by `+0x60` a step, so it barely
+    fades), removes its component along the up/normal vector (vt `+0x210`) and adds the rest to the output velocity.
+  - On the ground it looks the support body up (`(info[0x48] & 0x202) == 2`, then the body handle in the physics
+    world's body table) and, if it finds one, replaces the vector with that body's velocity at the contact point
+    (static ground: 0) and adds it. Only that path writes `+0x68` and resets the vector. A surface that slows by more
+    than `+0x64` m/s in a frame is held for 3 frames (`+0x6C` = 3).
+- **What resets it:** the extensions run from `main+0x130238`, which loops over `[x+0x38]` (count `[x+0x30]`) calling
+  slot 10 with `info` = a stack struct; `info+0x50` = `G+0x28` where `G = [prop+0x28]` (the ground contact: `+0x2C`
+  support body handle, `+0x118` ground layer, `+0x148` flags), so the lookup's flags word is `G+0x148`. While
+  grounded the same function sets bit 1 of it (`main+0x130710`) only if the ground layer is in the 64-bit mask
+  `[[main+0x4CB7940]]` = `0x2C5` (written once at `main+0x33727E4`): layers 0 Object, 2 GroundObject,
+  6 GroundHighRes, 7 GroundHighResSmooth, 9 GroundStaticTree (PhiveConfig entity layers, `tools/phive.py`). The
+  layer is the low 6 bits of `[[shape+0x60|0x68]+0x150]+8`, stored at `main+0x1327BC`. On any other layer bit 1
+  stays 0, the lookup is skipped and the vector is kept.
+  - The reset store is `main+0x13A12C` (`x24` = the support body), called from the extension loop at
+    `main+0x130AF8`.
+  - The other ground reset: if `[[prop+0x48]+0x60]` = 1 (the landing frame) and `G+0x148` bit 6 is set, the vector
+    is zeroed (`main+0x13A370`).
+- **The bug:** the velocity of a moving magic bean (GroundObject) is stored while Link stands on it, and a jump off
+  it carries it (about twice a normal jump's horizontal speed). Landing on ground of a layer outside the
+  mask, such as the Water-layer (5) slope below the bean, skips the reset, so every later jump gets the bean's
+  velocity added one frame after takeoff, until Link stands on allowed ground. The grass around the bean is
+  GroundHighRes (6) / GroundHighResSmooth (7) and clears it on landing. Bit 6 only comes a few frames after landing
+  there, so the landing-frame reset doesn't fire either.
+  - Standing still on that slope clears it after a few seconds: after the landing frame the contact is empty
+    (handle -1, layer 14, flags `0x40`) and Link sinks slowly until his contact reaches the
+    GroundHighRes body under it (flags `0x102`), which resets the vector.
+  - Other layers outside the mask (8 GroundHighResRough, 10 HitOnlyGround, ...) should keep it too.
+- The "stored vel" watch shows the vector, found by vtable in the holder's table.

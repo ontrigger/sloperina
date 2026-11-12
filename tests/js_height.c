@@ -17,11 +17,27 @@
 #include "z64hd.h"
 
 _Static_assert(sizeof(uintptr_t) == 8 && sizeof(float) == 4, "requires a 64-bit host with f32");
-_Static_assert(W_X == 0 && W_AIRWALL == 16 && W_JS_HEIGHT == 17, "keep saved watch IDs stable");
+_Static_assert(W_X == 0 && W_AIRWALL == 16 && W_JS_HEIGHT == 17 && W_STORED_VEL == 18,
+               "keep saved watch IDs stable");
 
 uintptr_t z64hd_main;
 static const struct z64hd_build test_build; /* no build: the version-specific paths stay off */
 const struct z64hd_build *z64hd_game = &test_build;
+
+/* Host memory mode (stored vel): real host objects; only registered regions count as mapped. */
+static bool host_mode;
+static struct { const void *p; size_t n; } regions[16];
+static int n_regions;
+static void region(const void *p, size_t n) { regions[n_regions].p = p; regions[n_regions++].n = n; }
+static bool host_mapped(uintptr_t addr, size_t size)
+{
+  for (int i = 0; i < n_regions; i++) {
+    uintptr_t lo = (uintptr_t)regions[i].p;
+    if (addr >= lo && size <= regions[i].n && addr - lo <= regions[i].n - size)
+      return true;
+  }
+  return false;
+}
 bool enemy_hp_shown;
 bool cheats[CHEAT_COUNT], frame_advance, pause_display, warp_arrival_cutscenes;
 bool levitate_enabled, levitate_through_walls, airwalls_shown, airwalls_push, airwalls_block, airwalls_all;
@@ -40,6 +56,8 @@ uintptr_t link_actor(void) { return actor; }
 bool sys_mapped(uintptr_t addr, size_t size, uint32_t perm)
 {
   assert(perm == SYS_PERM_R || perm == (SYS_PERM_R | SYS_PERM_W));
+  if (host_mode)
+    return perm == SYS_PERM_R && host_mapped(addr, size);
   if (size == 8)
     return (addr == base + 0x270 && unavailable != 1) ||
            (addr == base + 0x1000 + 0x358 && unavailable != 2);
@@ -55,6 +73,8 @@ uintptr_t sys_ptr(uintptr_t addr)
   reads++;
   if ((addr & 7) || !sys_mapped(addr, 8, SYS_PERM_R))
     return 0;
+  if (host_mode)
+    return *(const uintptr_t *)addr;
   return addr == base + 0x270 ? first : player;
 }
 bool sys_read32(uintptr_t addr, uint32_t *out)
@@ -62,7 +82,9 @@ bool sys_read32(uintptr_t addr, uint32_t *out)
   reads++;
   if ((addr & 3) || !sys_mapped(addr, 4, SYS_PERM_R))
     return false;
-  if (live_target)
+  if (host_mode)
+    memcpy(out, (const void *)addr, 4);
+  else if (live_target)
     memcpy(out, live_target, 4);
   else
     *out = value;
@@ -184,12 +206,98 @@ static void test_values(void)
   puts("PASS: f32 precision, FLT_MAX, relocation, null/unmapped/unaligned/overflow, recovery");
 }
 
+static void expect_stored(const char *s)
+{
+  char text[48];
+  watch_text(W_STORED_VEL, text, sizeof(text));
+  if (strcmp(text, s)) fprintf(stderr, "expected '%s', got '%s'\n", s, text);
+  assert(strcmp(text, s) == 0);
+}
+
+static void test_stored_vel(void)
+{
+  /* Unknown build: nothing is read. */
+  chain(UINT64_C(0x2300000000), 1.0f);
+  reads = 0;
+  expect_stored("N/A");
+  assert(reads == 0);
+
+  /* link+0x270 -> a, a+0x50 -> b, b+0x20 -> c, c+0x10 -> holder; holder+0xD8 count, +0xE0 components */
+  static uintptr_t link_obj[0x278 / 8], a[0x58 / 8], b[0x28 / 8], c[0x18 / 8], holder[0xE8 / 8];
+  static uintptr_t comps[3], other[0x60 / 8], surface[0x60 / 8];
+  static uintptr_t vtables[2]; /* stand-ins for main+vt_follow_surface and another component's */
+  static struct z64hd_build surface_build = { .vt_follow_surface = 0x100 };
+  z64hd_game = &surface_build;
+  z64hd_main = (uintptr_t)&vtables[0] - 0x100;
+  link_obj[0x270 / 8] = (uintptr_t)a;
+  a[0x50 / 8] = (uintptr_t)b;
+  b[0x20 / 8] = (uintptr_t)c;
+  c[0x10 / 8] = (uintptr_t)holder;
+  uint32_t count = 3;
+  memcpy((char *)holder + 0xD8, &count, 4);
+  holder[0xE0 / 8] = (uintptr_t)comps;
+  comps[0] = (uintptr_t)other, comps[1] = 0, comps[2] = (uintptr_t)surface;
+  other[0] = (uintptr_t)&vtables[1];
+  surface[0] = (uintptr_t)&vtables[0];
+  float vel[3] = { 1.72f, -0.06f, -4.59f };
+  memcpy((char *)surface + 0x54, vel, sizeof(vel));
+  memcpy((char *)other + 0x54, (float[3]){ 9, 9, 9 }, 12);
+  n_regions = 0;
+  region(link_obj, sizeof(link_obj)), region(a, sizeof(a)), region(b, sizeof(b)), region(c, sizeof(c));
+  region(holder, sizeof(holder)), region(comps, sizeof(comps)), region(other, sizeof(other));
+  region(surface, sizeof(surface)), region(vtables, sizeof(vtables));
+  host_mode = true;
+  actor = (uintptr_t)link_obj;
+
+  expect_stored("1.72 -0.06 -4.59"); /* the follow-surface component, not the first one */
+  uintptr_t addr;
+  int type;
+  watch_entry_t entry = { .id = W_STORED_VEL };
+  assert(watch_entry_has_address(&entry) && watch_entry_address(&entry, &addr, &type));
+  assert(addr == (uintptr_t)surface + 0x54 && type == MW_F32); /* the wrench */
+  vel[0] = 0;
+  memcpy((char *)surface + 0x54, vel, 4);
+  expect_stored("0.00 -0.06 -4.59"); /* read afresh each time */
+  vel[0] = 1.72f;
+  memcpy((char *)surface + 0x54, vel, 4);
+
+  surface[0] = (uintptr_t)&vtables[1];
+  expect_stored("N/A"); /* no component with the vtable */
+  surface[0] = (uintptr_t)&vtables[0];
+  count = 65;
+  memcpy((char *)holder + 0xD8, &count, 4);
+  expect_stored("N/A"); /* a corrupt count is not scanned */
+  count = 2;
+  memcpy((char *)holder + 0xD8, &count, 4);
+  expect_stored("N/A"); /* only the first `count` entries */
+  count = 3;
+  memcpy((char *)holder + 0xD8, &count, 4);
+  b[0x20 / 8] = 0;
+  expect_stored("N/A"); /* a missing link in the chain */
+  b[0x20 / 8] = (uintptr_t)c + 1;
+  expect_stored("N/A"); /* misaligned */
+  b[0x20 / 8] = (uintptr_t)c;
+  expect_stored("1.72 -0.06 -4.59");
+  regions[7].n = 0x54 + 8; /* the surface component: its vector runs past the mapping */
+  expect_stored("N/A");
+  regions[7].n = sizeof(surface);
+  expect_stored("1.72 -0.06 -4.59"); /* recovers */
+
+  host_mode = false;
+  n_regions = 0;
+  z64hd_game = &test_build;
+  z64hd_main = 0;
+  puts("PASS: stored vel: unknown build, vtable scan, count, chain, mapping, wrench address, recovery");
+}
+
 static void test_settings(void)
 {
   snprintf(settings, sizeof(settings), "watch_list=16:0:1,2:2:0,0:1:1\nwatch_label_2=east\n"
            "watches_shown=0\nwatch_position=3\n");
   settings_load();
-  assert(watch_count == 4 && watch_list[3].id == W_JS_HEIGHT && !watch_list[3].hidden);
+  /* old settings: both permanent built-ins added at the end, stored vel below JS Height */
+  assert(watch_count == 5 && watch_list[3].id == W_JS_HEIGHT && !watch_list[3].hidden);
+  assert(watch_list[4].id == W_STORED_VEL && !watch_list[4].hidden);
   assert(watch_list[0].id == W_AIRWALL && watch_list[0].hidden);
   assert(watch_list[1].id == W_Z && !strcmp(watch_list[1].label, "east") && watch_types[W_Z] == 2);
   assert(watch_list[2].id == W_X && watch_list[2].hidden && watch_types[W_X] == 1);
@@ -201,23 +309,24 @@ static void test_settings(void)
   assert(strstr(settings, "17:0:1") && strstr(settings, "watch_label_17=custom JS"));
   watch_set_list(NULL, 0);
   settings_load();
-  assert(watch_count == 4 && watch_list[2].id == W_JS_HEIGHT && watch_list[2].hidden);
+  assert(watch_count == 5 && watch_list[2].id == W_JS_HEIGHT && watch_list[2].hidden);
   assert(!strcmp(watch_list[2].label, "custom JS"));
-  assert(!watch_add(W_JS_HEIGHT));
+  assert(!watch_add(W_JS_HEIGHT) && !watch_add(W_STORED_VEL));
+  watch_remove(4); /* stored vel */
   watch_remove(2);
   for (int i = 0; i < 60; i++) settings_frame(false);
   settings_load();
-  assert(watch_count == 4 && watch_list[3].id == W_JS_HEIGHT); /* permanent after restart */
-  assert(!watch_list[3].hidden);
+  assert(watch_count == 5 && watch_list[3].id == W_JS_HEIGHT); /* permanent after restart */
+  assert(watch_list[4].id == W_STORED_VEL && !watch_list[3].hidden && !watch_list[4].hidden);
 
   snprintf(settings, sizeof(settings), "watches=5\n"); /* legacy bitmask */
   settings_load();
-  assert(watch_count == 3 && watch_list[0].id == W_X && watch_list[1].id == W_Z);
-  assert(watch_list[2].id == W_JS_HEIGHT);
+  assert(watch_count == 4 && watch_list[0].id == W_X && watch_list[1].id == W_Z);
+  assert(watch_list[2].id == W_JS_HEIGHT && watch_list[3].id == W_STORED_VEL);
   snprintf(settings, sizeof(settings), "watch_list=\n");
   settings_load();
-  assert(watch_count == 1 && watch_list[0].id == W_JS_HEIGHT);
-  assert(watch_add_memory(0x10000, MW_F32) && watch_list[1].id == W_MEMORY);
+  assert(watch_count == 2 && watch_list[0].id == W_JS_HEIGHT && watch_list[1].id == W_STORED_VEL);
+  assert(watch_add_memory(0x10000, MW_F32) && watch_list[2].id == W_MEMORY);
   assert(!watch_add_memory(0x10000, MW_X32));
   snprintf(settings, sizeof(settings), "levitate_speed=0\n");
   levitate_speed = 4;
@@ -237,7 +346,7 @@ static void test_settings(void)
   assert(levitate_speed == 4); /* existing positive settings still work */
   sd_available = false;
   settings_load();
-  assert(watch_has(W_JS_HEIGHT));
+  assert(watch_has(W_JS_HEIGHT) && watch_has(W_STORED_VEL));
   puts("PASS: old/current settings, IDs, order, labels, visibility, restart, memory watches, no SD");
 }
 
@@ -268,9 +377,10 @@ static void test_hud(const char *image)
   watches_frame(false);
   gfx_frame();
   const gfx_screen_t *s = gfx_published();
-  assert(s && s->panel[1].rows == 1);
+  assert(s && s->panel[1].rows == 2);
   const gfx_panel_t *p = &s->panel[1];
   assert(!strncmp(p->ch[0], "jump height  Max", 16));
+  assert(!strncmp(p->ch[1], "stored vel   N/A", 16)); /* below jump height; no build here */
   js_height_lock = true;
   watches_frame(false);
   gfx_frame();
@@ -290,11 +400,13 @@ static void test_hud(const char *image)
   gfx_frame();
   assert(!strncmp(gfx_published()->panel[1].ch[0], "jump height  Max", 16));
   watch_set_hidden(0, true);
+  watch_set_hidden(1, true);
   watches_frame(false);
   gfx_frame();
   s = gfx_published();
   assert(!s || !s->panel[1].rows);
   watch_set_hidden(0, false);
+  watch_set_hidden(1, false);
   watches_shown = false;
   watches_frame(false);
   gfx_frame();
@@ -403,12 +515,16 @@ static void test_reset_lock(void)
 
 int main(int argc, char **argv)
 {
-  assert(watches_shown && watch_count == 7 && watch_list[6].id == W_JS_HEIGHT && !watch_list[6].hidden);
+  assert(watches_shown && watch_count == 8 && watch_list[6].id == W_JS_HEIGHT && !watch_list[6].hidden);
+  assert(watch_list[7].id == W_STORED_VEL && !watch_list[7].hidden); /* default, below JS Height */
   int n, current;
   const char *const *types = watch_entry_types(&watch_list[6], &n, &current);
   assert(n == 1 && current == 0 && !strcmp(types[0], "f32"));
   assert(watch_entry_has_address(&watch_list[6])); /* the wrench (debug > memory), added with save/load position */
+  watch_entry_types(&watch_list[7], &n, &current);
+  assert(n == 0); /* three numbers: no display types */
   test_values();
+  test_stored_vel();
   test_settings();
   test_hud(argc > 1 ? argv[1] : NULL);
   test_menu_filler(argc > 2 ? argv[2] : NULL);

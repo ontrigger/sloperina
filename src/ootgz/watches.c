@@ -19,7 +19,7 @@ float hypotf(float x, float y);
 
 const char *const watch_labels[W_COUNT] = {
   "x", "y", "z", "facing", "move angle", "speed", "y speed", "camera angle", "camera pitch",
-  "camera dist", "input", "stick", "lag", "timer", "frame", "map", "air wall", "jump height",
+  "camera dist", "input", "stick", "lag", "timer", "frame", "map", "air wall", "jump height", "stored vel",
 };
 const char *const watches_corner_names[GFX_NPLACES] = { "top-left", "top-right", "bottom-left", "bottom-right",
                                                        "top-centre", "bottom-centre", "custom" };
@@ -27,9 +27,9 @@ const char *const watches_corner_names[GFX_NPLACES] = { "top-left", "top-right",
 bool watches_shown = true;
 watch_entry_t watch_list[WATCH_MAX] = {
   { .id = W_X }, { .id = W_Y }, { .id = W_Z }, { .id = W_FACING }, { .id = W_SPEED }, { .id = W_CAMERA_ANGLE },
-  { .id = W_JS_HEIGHT },
+  { .id = W_JS_HEIGHT }, { .id = W_STORED_VEL },
 };
-int watch_count = 7;
+int watch_count = 8;
 uint32_t watch_version;
 
 const char *const memory_type_names[MW_NTYPES] = { "u8", "s8", "x8", "u16", "s16", "x16", "u32", "s32",
@@ -81,9 +81,11 @@ void watch_set_list(const watch_t *list, int n)
   for (int i = 0; i < n && watch_count < WATCH_MAX; i++)
     if (list[i] >= 0 && list[i] < W_COUNT && !watch_has(list[i]))
       watch_list[watch_count++] = (watch_entry_t){ .id = (int16_t)list[i] };
-  /* Permanent built-in, including for old settings. Existing entries keep their order;
-   * settings.c restores labels/visibility afterwards. Hide it to keep it off across boots. */
+  /* Permanent built-ins, including for old settings (stored vel lands below JS Height there).
+   * Existing entries keep their order; settings.c restores labels/visibility afterwards. Hide one
+   * to keep it off across boots. */
   watch_add(W_JS_HEIGHT);
+  watch_add(W_STORED_VEL);
   watch_version++;
 }
 
@@ -423,6 +425,57 @@ static bool js_height(float *out)
 
 bool js_height_lock; /* opt-in for this session; never enabled by loading settings */
 
+/* Stored velocity: Link's CharacterUpdateFollowSurfaceExtension (FINDINGS 9.7) keeps the velocity of
+ * the surface he stands on at +0x54 (3 f32, units/s) and adds it, minus its up component, to his
+ * velocity while airborne. Only standing on a support body the game finds replaces it, so after a
+ * moving platform (a magic bean) it can stay and be added to later jumps. */
+#define HOLDER_COMPONENT_COUNT 0xD8 /* u32 */
+#define HOLDER_COMPONENTS 0xE0      /* the component pointers */
+#define HOLDER_COMPONENTS_MAX 64    /* 30 in v131072; more is a corrupt count */
+#define FOLLOW_SURFACE_VEL 0x54
+
+static uintptr_t next_ptr(uintptr_t p, uintptr_t offset)
+{
+  return p && p <= UINTPTR_MAX - offset ? sys_ptr(p + offset) : 0;
+}
+
+bool stored_vel_address(uintptr_t *addr)
+{
+  if (!z64hd_game || !z64hd_game->vt_follow_surface)
+    return false;
+  static const uintptr_t chain[] = { 0x270, 0x50, 0x20, 0x10 }; /* to the component holder */
+  uintptr_t holder = link_actor();
+  for (unsigned i = 0; i < sizeof(chain) / sizeof(*chain); i++)
+    holder = next_ptr(holder, chain[i]);
+  uint32_t count;
+  if (!holder || holder > UINTPTR_MAX - HOLDER_COMPONENTS || !sys_read32(holder + HOLDER_COMPONENT_COUNT, &count) ||
+      count > HOLDER_COMPONENTS_MAX)
+    return false;
+  uintptr_t components = next_ptr(holder, HOLDER_COMPONENTS);
+  if (!components || components > UINTPTR_MAX - count * sizeof(uintptr_t))
+    return false;
+  uintptr_t vtable = MAIN(z64hd_game->vt_follow_surface);
+  for (uint32_t i = 0; i < count; i++) {
+    uintptr_t component = sys_ptr(components + i * sizeof(uintptr_t));
+    if (component && sys_ptr(component) == vtable && component <= UINTPTR_MAX - FOLLOW_SURFACE_VEL - 12 &&
+        sys_mapped(component + FOLLOW_SURFACE_VEL, 12, SYS_PERM_R)) {
+      *addr = component + FOLLOW_SURFACE_VEL;
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool stored_vel(float out[3])
+{
+  uintptr_t addr;
+  if (!stored_vel_address(&addr))
+    return false;
+  for (int i = 0; i < 3; i++)
+    out[i] = ((volatile float *)addr)[i];
+  return true;
+}
+
 static const struct { uint32_t bit; const char *name; } button_names[] = {
   { BTN_A, "A" }, { BTN_B, "B" }, { BTN_X, "X" }, { BTN_Y, "Y" }, { BTN_L, "L" }, { BTN_R, "R" },
   { BTN_ZL, "ZL" }, { BTN_ZR, "ZR" }, { BTN_PLUS, "+" }, { BTN_MINUS, "-" }, { BTN_LSTICK, "L3" },
@@ -647,6 +700,14 @@ void watch_text(watch_t watch, char *buf, int len)
         snprintf(buf, len, "N/A");
       break;
     }
+    case W_STORED_VEL: { /* x y z, units/s */
+      float v[3];
+      if (stored_vel(v))
+        snprintf(buf, len, "%.2f %.2f %.2f", (double)v[0], (double)v[1], (double)v[2]);
+      else
+        snprintf(buf, len, "N/A");
+      break;
+    }
     default:
       break;
   }
@@ -746,7 +807,7 @@ bool watch_entry_has_address(const watch_entry_t *entry)
 {
   switch (entry->id) {
     case W_MEMORY: case W_X: case W_Y: case W_Z: case W_FACING: case W_Y_SPEED: case W_CAMERA_ANGLE:
-    case W_CAMERA_PITCH: case W_CAMERA_DIST: case W_FRAME: case W_MAP: case W_JS_HEIGHT:
+    case W_CAMERA_PITCH: case W_CAMERA_DIST: case W_FRAME: case W_MAP: case W_JS_HEIGHT: case W_STORED_VEL:
       return true;
     default:
       return false;
@@ -790,6 +851,10 @@ bool watch_entry_address(const watch_entry_t *entry, uintptr_t *addr, int *mw_ty
       break;
     case W_JS_HEIGHT:
       found = js_height_addr();
+      break;
+    case W_STORED_VEL: /* x, y, z */
+      if (!stored_vel_address(&found))
+        found = 0;
       break;
     default:
       return false;

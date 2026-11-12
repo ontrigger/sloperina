@@ -8,7 +8,7 @@
 typedef enum {
   W_X, W_Y, W_Z, W_FACING, W_MOVE_ANGLE, W_SPEED, W_Y_SPEED, W_CAMERA_ANGLE, W_CAMERA_PITCH,
   W_CAMERA_DIST, W_INPUT, W_STICK, W_LAG, W_TIMER, W_FRAME, W_MAP, W_AIRWALL,
-  W_JS_HEIGHT, W_COUNT /* append only: built-in IDs are saved in settings.ini */
+  W_JS_HEIGHT, W_STORED_VEL, W_COUNT /* append only: built-in IDs are saved in settings.ini */
 } watch_t;
 
 extern const char *const watch_labels[W_COUNT];
@@ -37,7 +37,7 @@ bool watch_has(watch_t w);
 bool watch_add(watch_t w);         /* false if it's already there */
 bool watch_add_memory(uintptr_t addr, int type); /* false if that address is already watched */
 void watch_remove(int index);
-void watch_set_list(const watch_t *list, int n); /* settings; includes JS Height if missing */
+void watch_set_list(const watch_t *list, int n); /* settings; includes JS Height and stored vel if missing */
 /* an entry's label, value, and display types (and its current one) */
 void watch_entry_label(const watch_entry_t *e, char *buf, int len);
 void watch_entry_display_label(const watch_entry_t *e, char *buf, int len);
@@ -49,6 +49,9 @@ void watch_entry_set_type(int index, int type);
 bool watch_entry_has_address(const watch_entry_t *e);
 /* JS Height's f32: [[link_actor() + 0x270] + 0x358] + 0x18E8 (false while a pointer is missing) */
 bool js_height_address(uintptr_t *addr);
+/* The follow-surface velocity Link keeps (3 f32; FINDINGS 9.7): found by vtable in the component table
+ * of [[[link_actor() + 0x270] + 0x50] + 0x20] + 0x10 (false while unknown for the build or missing) */
+bool stored_vel_address(uintptr_t *addr);
 bool watch_entry_address(const watch_entry_t *e, uintptr_t *addr, int *mw_type);
 void watch_move(int index, int dir);              /* up (-1) or down (+1) the list */
 void watch_set_label(int index, const char *label); /* "" = its own name again */

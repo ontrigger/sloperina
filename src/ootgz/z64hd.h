@@ -82,6 +82,9 @@ struct z64hd_build {
   uint32_t cct_force_no_hit;  /* void (body, bool): queued, preserves filter state */
   uint32_t cct_set_position;  /* void (property, const vec3f_t *): updates attached bodies */
   uint32_t cct_set_velocity;  /* void (body, const vec3f_t *): queues linear velocity */
+  /* CharacterUpdateFollowSurfaceExtension (watches.c, FINDINGS 9.7): the moving-surface velocity it
+   * keeps and adds to Link's jumps; 0: not known for this build */
+  uint32_t vt_follow_surface;
   struct z64hd_link_path link_paths[5];
 };
 

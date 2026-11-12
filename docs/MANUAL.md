@@ -193,9 +193,10 @@ row of buttons:
 Under the list:
 
 - **📁 (known watches)**: the built-in watches: x, y, z, facing, move angle, speed, y speed, camera angle /
-  pitch / distance, input, stick, lag, timer, frame, map, air wall, jump height. Each can be in the list once.
-  **jump height** is the height your last jump set (takeoff + 0.7; FLT_MAX until you jump after a load), which
-  the jumpslash launch is limited to. It's always in the list (hide it to keep it off screen).
+  pitch / distance, input, stick, lag, timer, frame, map, air wall, jump height, stored vel. Each can be in the
+  list once. **jump height** is the height your last jump set (takeoff + 0.7; FLT_MAX until you jump after a load),
+  which the jumpslash launch is limited to. **stored vel** is the velocity of the moving surface the game keeps
+  for Link (see below). Both are always in the list (hide one to keep it off screen).
 - **+ (custom watch)**: a watch of any memory address. Type the address (D-pad left / right: digit, up / down:
   change it), **L** to add. It starts from your last memory watch, as in gz. One watch per address. Changed your
   mind? **B**, or D-pad left past the first digit to the **x** that takes the folder's place and **L**: no watch is
@@ -218,6 +219,13 @@ Memory watches aren't saved (addresses change every time the game starts); every
 threshold on each read, showing an f32 with nine significant digits, **Max** for `FLT_MAX`, or **N/A**
 if unavailable. A padlock beside its name in the HUD and Watches list indicates that **lock jump height**
 is enabled. Custom names are preserved; long names are shortened on screen to leave room for the icon.
+
+**stored vel** is the eighth default watch, below jump height (with old settings it's added after it). It shows
+x, y and z in units per second, or **N/A** where it can't be found (1.0.0 isn't supported). The game sets it to the
+velocity of the moving surface Link stands on (a magic bean) and adds it, without the up/down part, to his speed
+in the air. Normally it goes back to 0 when he lands on still ground, but on some ground the game doesn't
+reset it: then every jump gets it added again until he stands somewhere that does. A non-zero value on still
+ground means the next jump carries it.
 
 Under the watch list, the **jump height** controls change that threshold:
 
